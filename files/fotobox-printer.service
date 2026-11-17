@@ -1,0 +1,12 @@
+[Unit]
+Description=Fotobox-PrintServer: Warteschlange fuer den angeschlossenen Drucker
+After=cups.service
+Wants=cups.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 15
+ExecStart=/usr/local/sbin/fotobox-printer
+
+[Install]
+WantedBy=multi-user.target

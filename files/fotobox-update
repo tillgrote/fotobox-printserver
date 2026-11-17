@@ -1,0 +1,27 @@
+#!/bin/bash
+# Holt den aktuellen Stand der PrintServer-Skripte von GitHub und spielt ihn ein.
+# Wird ueber die Seite des PrintServers gestartet (Knopf "Aktualisieren") oder
+# von Hand: sudo fotobox-update
+REPO_DIR=/opt/fotobox-printserver
+STATE_DIR=/var/lib/fotobox
+LOG=/var/log/fotobox-update.log
+mkdir -p "$STATE_DIR"
+exec >>"$LOG" 2>&1
+echo "=== Update $(date '+%Y-%m-%d %H:%M:%S') ==="
+echo "laeuft $(date '+%d.%m.%Y %H:%M')" > "$STATE_DIR/update-status"
+
+fail() {
+  echo "FEHLER: $1"
+  echo "fehlgeschlagen $(date '+%d.%m.%Y %H:%M'): $1" > "$STATE_DIR/update-status"
+  exit 1
+}
+
+cd "$REPO_DIR" || fail "Ordner $REPO_DIR fehlt"
+BEFORE=$(git rev-parse --short HEAD 2>/dev/null)
+git fetch --depth 1 origin main || fail "GitHub nicht erreichbar"
+git reset --hard FETCH_HEAD || fail "Stand konnte nicht uebernommen werden"
+AFTER=$(git rev-parse --short HEAD)
+echo "Stand: $BEFORE -> $AFTER"
+bash "$REPO_DIR/install.sh" --update || fail "Einrichtung meldet einen Fehler, siehe $LOG"
+echo "ok $(date '+%d.%m.%Y %H:%M'), Stand $AFTER" > "$STATE_DIR/update-status"
+echo "Update fertig"

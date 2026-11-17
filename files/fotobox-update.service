@@ -1,0 +1,7 @@
+[Unit]
+Description=Fotobox-PrintServer: Update von GitHub
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fotobox-update

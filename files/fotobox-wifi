@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""WLAN-Einrichtung und Update-Knopf fuer den Fotobox-PrintServer.
+
+Laeuft auf Raspberry Pi OS mit NetworkManager (Bookworm, Trixie).
+
+Solange der Pi in einem bekannten WLAN ist, zeigt er unter http://<name>.local/
+eine Seite, auf der man ein anderes WLAN waehlen und die Software aktualisieren
+kann. Findet er etwa 40 Sekunden lang kein bekanntes WLAN, oeffnet er ein
+eigenes Einrichtungs-WLAN; dieselbe Seite steht dann unter http://10.42.0.1/.
+
+Einstellungen in /etc/fotobox-wifi.conf (Zeilen NAME=Wert):
+  AP_SSID      Name des Einrichtungs-WLANs (Standard: <hostname>-Setup)
+  AP_PASSWORD  Passwort dafuer, mindestens 8 Zeichen (Pflicht)
+"""
+import html
+import http.server
+import os
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+CONF = "/etc/fotobox-wifi.conf"
+VERSION_FILE = "/etc/fotobox-printserver.version"
+UPDATE_STATUS = "/var/lib/fotobox/update-status"
+IFACE = "wlan0"
+AP_CON = "fotobox-setup"
+PORT = 80
+OFFLINE_GRACE = 40        # Sekunden ohne WLAN, bevor das Einrichtungs-WLAN startet
+AP_RETRY = 600            # so oft prueft der Pi im Einrichtungsmodus, ob ein bekanntes WLAN wieder da ist
+
+lock = threading.Lock()
+networks = []             # [(ssid, signal, security)] vom letzten Scan
+last_request = 0.0        # Zeit des letzten Seitenaufrufs
+busy = False              # ein Verbindungsversuch laeuft
+message = ""              # Ergebnis der letzten Aktion
+
+
+def log(text):
+    print(text, flush=True)
+
+
+def run(args, timeout=60):
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                              env={**os.environ, "LC_ALL": "C"})
+        return done.returncode, (done.stdout + done.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, "Zeitüberschreitung"
+    except OSError as error:
+        return 127, str(error)
+
+
+def read_file(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def read_conf():
+    conf = {}
+    for line in read_file(CONF).splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            conf[key.strip()] = value.strip()
+    return conf
+
+
+def split_terse(line):
+    """Zerlegt eine Zeile von `nmcli -t` (Trenner ':', maskiert als '\\:')."""
+    fields, current, escaped = [], "", False
+    for char in line:
+        if escaped:
+            current += char
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == ":":
+            fields.append(current)
+            current = ""
+        else:
+            current += char
+    fields.append(current)
+    return fields
+
+
+def wifi_status():
+    """(Zustand, Verbindungsname) der WLAN-Schnittstelle."""
+    code, out = run(["nmcli", "-t", "-f", "DEVICE,STATE,CONNECTION", "device", "status"])
+    for line in out.splitlines():
+        fields = split_terse(line)
+        if len(fields) >= 3 and fields[0] == IFACE:
+            return fields[1], fields[2]
+    return "unknown", ""
+
+
+def client_connected():
+    state, connection = wifi_status()
+    return state == "connected" and connection != AP_CON
+
+
+def ap_active():
+    state, connection = wifi_status()
+    return connection == AP_CON and state.startswith(("connected", "connecting"))
+
+
+def current_ssid():
+    code, out = run(["nmcli", "-t", "-f", "ACTIVE,SSID", "device", "wifi", "list", "ifname", IFACE, "--rescan", "no"])
+    for line in out.splitlines():
+        fields = split_terse(line)
+        if len(fields) >= 2 and fields[0] == "yes":
+            return fields[1]
+    return ""
+
+
+def scan():
+    global networks
+    code, out = run(["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list", "ifname", IFACE, "--rescan", "yes"])
+    best = {}
+    for line in out.splitlines():
+        fields = split_terse(line)
+        if len(fields) < 3 or not fields[0]:
+            continue
+        try:
+            signal = int(fields[1])
+        except ValueError:
+            signal = 0
+        if fields[0] not in best or signal > best[fields[0]][0]:
+            best[fields[0]] = (signal, fields[2])
+    found = sorted(((ssid, value[0], value[1]) for ssid, value in best.items()), key=lambda item: -item[1])
+    if found:
+        with lock:
+            networks = found
+    log("Scan: %d Netze" % len(found))
+
+
+def start_ap():
+    conf = read_conf()
+    password = conf.get("AP_PASSWORD", "")
+    ssid = conf.get("AP_SSID") or socket.gethostname() + "-Setup"
+    if len(password) < 8:
+        log("AP_PASSWORD in %s fehlt oder ist kürzer als 8 Zeichen, kein Einrichtungs-WLAN" % CONF)
+        return
+    scan()  # im Hotspot-Betrieb kann der Pi nicht mehr suchen
+    run(["nmcli", "connection", "delete", "id", AP_CON])
+    code, out = run(["nmcli", "device", "wifi", "hotspot", "ifname", IFACE, "con-name", AP_CON, "ssid", ssid, "password", password])
+    log("Einrichtungs-WLAN '%s' starten: %s" % (ssid, "ok" if code == 0 else out))
+    run(["nmcli", "connection", "modify", "id", AP_CON, "connection.autoconnect", "no"])
+
+
+def stop_ap():
+    run(["nmcli", "connection", "down", "id", AP_CON])
+
+
+def connect(ssid, password):
+    """Wechselt ins angegebene WLAN. Schlaegt es fehl, greift die Ueberwachung wieder."""
+    global busy, message
+    try:
+        time.sleep(2)  # die Antwortseite soll noch ankommen
+        previous = "" if ap_active() else wifi_status()[1]
+        stop_ap()
+        time.sleep(2)
+        run(["nmcli", "device", "wifi", "rescan", "ifname", IFACE])
+        time.sleep(4)
+        args = ["nmcli", "--wait", "45", "device", "wifi", "connect", ssid, "ifname", IFACE]
+        if password:
+            args += ["password", password]
+        code, out = run(args, timeout=70)
+        if code == 0:
+            message = "Verbunden mit „%s“." % ssid
+            log("Verbunden mit '%s'" % ssid)
+        else:
+            message = "Die Verbindung mit „%s“ hat nicht geklappt. Passwort und Netzname prüfen." % ssid
+            log("Verbindung mit '%s' fehlgeschlagen: %s" % (ssid, out.replace(password, "***") if password else out))
+            if previous != ssid:
+                run(["nmcli", "connection", "delete", "id", ssid])
+            if previous:
+                run(["nmcli", "--wait", "30", "connection", "up", "id", previous], timeout=45)
+    finally:
+        busy = False
+
+
+def monitor():
+    offline_since = None
+    ap_since = None
+    while True:
+        time.sleep(10)
+        if busy:
+            offline_since = None
+            continue
+        if client_connected():
+            offline_since = None
+            ap_since = None
+        elif ap_active():
+            offline_since = None
+            ap_since = ap_since or time.time()
+            idle = time.time() - max(ap_since, last_request)
+            if idle > AP_RETRY:
+                # Vielleicht war der Router nur kurz weg: einmal nachsehen.
+                log("Einrichtungs-WLAN pausiert, suche bekannte Netze")
+                stop_ap()
+                ap_since = None
+                offline_since = time.time() - OFFLINE_GRACE + 30
+        else:
+            offline_since = offline_since or time.time()
+            if time.time() - offline_since > OFFLINE_GRACE:
+                start_ap()
+                offline_since = None
+                ap_since = time.time()
+
+
+PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PrintServer</title>
+<style>
+body{font-family:-apple-system,Helvetica,Arial,sans-serif;margin:0;background:#f2f2f7;color:#111}
+main{max-width:480px;margin:0 auto;padding:24px}
+h1{font-size:22px} h2{font-size:17px;margin:0 0 8px} p{line-height:1.4}
+.box{background:#fff;border-radius:12px;padding:16px;margin:16px 0}
+label{display:block;margin:12px 0 4px;font-weight:600}
+select,input{width:100%%;box-sizing:border-box;font-size:17px;padding:10px;border:1px solid #c7c7cc;border-radius:8px}
+button{margin-top:16px;width:100%%;font-size:17px;padding:12px;border:0;border-radius:10px;background:#007aff;color:#fff}
+button.plain{background:#e5e5ea;color:#111}
+.note{color:#6e6e73;font-size:14px}
+</style></head><body><main>
+<h1>PrintServer %(host)s</h1>
+<div class="box"><p>%(status)s</p>%(message)s</div>
+%(body)s
+</main></body></html>"""
+
+FORM = """<div class="box"><h2>WLAN wechseln</h2><form method="post" action="/connect">
+<label for="ssid">WLAN aus der Liste</label>
+<select id="ssid" name="ssid"><option value="">(bitte wählen)</option>%(options)s</select>
+<label for="other">oder Netzname von Hand</label>
+<input id="other" name="other" autocapitalize="none" autocorrect="off">
+<label for="password">Passwort</label>
+<input id="password" name="password" type="password" autocapitalize="none" autocorrect="off">
+<button type="submit">Verbinden</button>
+</form>
+<p class="note">Die Liste stammt von der letzten Suche des PrintServers. <a href="/?scan=1">Neu suchen</a> geht nur, solange er selbst in einem WLAN ist.</p></div>
+<div class="box"><h2>Software</h2>
+<p>Stand: %(version)s<br>Letztes Update: %(update)s</p>
+<form method="post" action="/update"><button class="plain" type="submit">Aktualisieren</button></form>
+<p class="note">Holt den aktuellen Stand von GitHub. Dafür braucht der PrintServer ein WLAN mit Internet. Während des Updates ist diese Seite kurz nicht erreichbar.</p></div>"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def send_page(self, status, body, code=200):
+        text = PAGE % {
+            "host": html.escape(socket.gethostname()),
+            "status": status,
+            "message": ("<p><b>%s</b></p>" % html.escape(message)) if message else "",
+            "body": body,
+        }
+        data = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def redirect_home(self):
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def do_GET(self):
+        global last_request
+        last_request = time.time()
+        if self.path.startswith("/?scan=1") and client_connected() and not busy:
+            scan()
+        if client_connected():
+            status = "Verbunden mit dem WLAN „%s“." % html.escape(current_ssid() or "?")
+        elif ap_active():
+            status = "Einrichtungsmodus: Der PrintServer ist in keinem WLAN. Wähle das Netz, in das er soll."
+        else:
+            status = "Der PrintServer sucht gerade ein WLAN."
+        with lock:
+            options = "".join(
+                '<option value="%s">%s (%d %%%s)</option>' % (html.escape(ssid, quote=True), html.escape(ssid), signal, "" if security and security != "--" else ", offen")
+                for ssid, signal, security in networks)
+        self.send_page(status, FORM % {
+            "options": options,
+            "version": html.escape(read_file(VERSION_FILE) or "unbekannt"),
+            "update": html.escape(read_file(UPDATE_STATUS) or "noch keins"),
+        })
+
+    def do_POST(self):
+        global last_request, busy, message
+        last_request = time.time()
+        length = min(int(self.headers.get("Content-Length", "0") or 0), 4096)
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
+        if self.path == "/update":
+            if not client_connected():
+                message = "Für das Update muss der PrintServer in einem WLAN mit Internet sein."
+            else:
+                code, out = run(["systemctl", "start", "--no-block", "fotobox-update.service"])
+                message = "Update gestartet. In ein bis zwei Minuten die Seite neu laden." if code == 0 else "Das Update ließ sich nicht starten."
+                log("Update angestoßen: %s" % ("ok" if code == 0 else out))
+            self.redirect_home()
+            return
+        if self.path != "/connect":
+            self.send_page("Unbekannte Adresse.", "", 404)
+            return
+        ssid = (form.get("other", [""])[0].strip() or form.get("ssid", [""])[0]).strip()
+        password = form.get("password", [""])[0]
+        if not ssid or len(ssid.encode("utf-8")) > 32 or (password and not 8 <= len(password) <= 63):
+            message = "Bitte ein WLAN wählen. Das Passwort hat 8 bis 63 Zeichen (leer bei offenem Netz)."
+            self.redirect_home()
+            return
+        if busy:
+            self.send_page("Es läuft schon ein Verbindungsversuch. Bitte kurz warten.", "")
+            return
+        busy = True
+        message = ""
+        self.send_page(
+            "Der PrintServer verbindet sich jetzt mit „%s“." % html.escape(ssid),
+            '<div class="box"><p>Das dauert bis zu einer Minute. Ein Einrichtungs-WLAN verschwindet dabei.</p>'
+            "<p>Hat es geklappt, ist der PrintServer im neuen WLAN erreichbar. Hat es nicht geklappt, "
+            "ist er nach etwa einer Minute wieder dort, wo er vorher war.</p></div>")
+        threading.Thread(target=connect, args=(ssid, password), daemon=True).start()
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    if len(read_conf().get("AP_PASSWORD", "")) < 8:
+        log("Hinweis: AP_PASSWORD in %s fehlt, ohne es gibt es kein Einrichtungs-WLAN" % CONF)
+    if client_connected():
+        scan()
+    threading.Thread(target=monitor, daemon=True).start()
+    server = Server(("0.0.0.0", PORT), Handler)
+    log("PrintServer-Seite läuft auf Port %d" % PORT)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

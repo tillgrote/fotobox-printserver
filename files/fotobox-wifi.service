@@ -1,0 +1,12 @@
+[Unit]
+Description=Fotobox-PrintServer: WLAN-Einrichtung und Update-Seite
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/fotobox-wifi
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

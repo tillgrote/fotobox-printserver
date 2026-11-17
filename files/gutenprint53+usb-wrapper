@@ -1,0 +1,26 @@
+#!/bin/sh
+# Vorgeschaltetes CUPS-Backend fuer den DNP DS620.
+#
+# Das Format w243h432 (Gutenprint: 3.375x6) dient als Traeger fuer den
+# 5,6-cm-Fotostreifen. Der Drucker nimmt die Schnittlaenge in Schritten von
+# 0,1 Zoll (CNTRL FULL_CUTTER_SET); Gutenprint schickt fuer dieses Format den
+# Wert 34. Dieses Skript ersetzt ihn durch 22 (2,2 Zoll = 55,9 mm).
+# Alle anderen Auftraege und die Geraetesuche gehen unveraendert weiter.
+REAL=/usr/lib/cups/backend-real/gutenprint53+usb
+if [ $# -lt 5 ]; then exec "$REAL" "$@"; fi
+case "$5" in
+  *PageSize=w243h432*) ;;
+  *) exec "$REAL" "$@" ;;
+esac
+if [ $# -ge 6 ]; then SRC="$6"; else SRC=-; fi
+TMP=$(mktemp "${TMPDIR:-/tmp}/dnpcut.XXXXXX")
+cat "$SRC" | LC_ALL=C sed 's/FULL_CUTTER_SET 00000016034000000000000/FULL_CUTTER_SET 00000016022000000000000/' > "$TMP"
+if LC_ALL=C grep -q -a 'FULL_CUTTER_SET 00000016022' "$TMP"; then
+  echo "INFO: dnpcut: Schnittwert auf 22 gesetzt" >&2
+else
+  echo "INFO: dnpcut: kein passender Schnittbefehl im Auftrag" >&2
+fi
+"$REAL" "$1" "$2" "$3" "$4" "$5" "$TMP"
+RC=$?
+rm -f "$TMP"
+exit $RC

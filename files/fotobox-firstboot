@@ -1,0 +1,19 @@
+#!/bin/bash
+# Laeuft genau einmal auf einer Karte, die aus einem Basis-Abbild stammt
+# (Marke /etc/fotobox-firstboot): neue SSH-Schluessel, eigener Name,
+# Dateisystem auf die ganze Karte ausdehnen, Neustart.
+exec >>/var/log/fotobox-firstboot.log 2>&1
+set -x
+date
+rm -f /etc/ssh/ssh_host_*
+ssh-keygen -A
+SERIAL=$(sed -n 's/^Serial[[:space:]]*: //p' /proc/cpuinfo | tail -c 5)
+NAME="PrintServer-${SERIAL:-neu}"
+raspi-config nonint do_hostname "$NAME" || hostnamectl set-hostname "$NAME"
+if [ -f /etc/fotobox-wifi.conf ]; then
+  sed -i "s/^AP_SSID=.*/AP_SSID=${NAME}-Setup/" /etc/fotobox-wifi.conf
+fi
+raspi-config nonint do_expand_rootfs
+rm -f /etc/fotobox-firstboot
+sync
+systemctl reboot

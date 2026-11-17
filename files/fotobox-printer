@@ -1,0 +1,60 @@
+#!/bin/bash
+# Richtet die Warteschlange fuer den DNP DS620 ein und haelt sie passend.
+#
+# - Gibt es noch keine Gutenprint-Warteschlange, wird eine angelegt, sobald
+#   ein DS620 am USB haengt.
+# - Zeigt die Warteschlange auf einen anderen Drucker (andere Seriennummer),
+#   wird sie auf den angeschlossenen umgestellt.
+# - Fehlt der PPD die Fotobox-Anpassung, wird sie neu erzeugt und angepasst.
+#
+# Laeuft beim Start und wartet bis zu 30 Minuten auf einen Drucker.
+set -u
+MODEL="gutenprint.5.3://dnp-ds620/expert"
+PREFIX="gutenprint53+usb://dnp-ds620/"
+NEW_QUEUE="DS620"
+MARKER='Fotobox-Anpassung 2'
+DRIVER=/usr/lib/cups/driver/gutenprint.5.3
+
+queue_line() { lpstat -v 2>/dev/null | grep 'gutenprint53+usb://' | head -1; }
+
+apply_ppd() {
+  # $1 Warteschlange. Erzeugt die PPD frisch aus dem Treiber und passt sie an.
+  local queue="$1" raw patched
+  raw=$(mktemp /tmp/fotobox-ppd.XXXXXX)
+  patched=$(mktemp /tmp/fotobox-ppd.XXXXXX)
+  if "$DRIVER" cat "$MODEL" > "$raw" 2>/dev/null && [ -s "$raw" ] \
+     && /usr/local/sbin/fotobox-ppd "$raw" "$patched"; then
+    lpadmin -p "$queue" -P "$patched" && echo "PPD der Warteschlange $queue erneuert"
+  else
+    echo "PPD konnte nicht erzeugt oder angepasst werden"
+  fi
+  rm -f "$raw" "$patched"
+}
+
+for attempt in $(seq 1 60); do
+  FOUND=$(lpinfo -v 2>/dev/null | grep -o "${PREFIX}[^ ]*" | head -1)
+  if [ -n "$FOUND" ]; then
+    LINE=$(queue_line)
+    QUEUE=$(echo "$LINE" | sed -n 's/^device for \([^:]*\): .*/\1/p')
+    CURRENT=$(echo "$LINE" | sed -n 's/^device for [^:]*: \(.*\)$/\1/p')
+    if [ -z "$QUEUE" ]; then
+      QUEUE="$NEW_QUEUE"
+      lpadmin -p "$QUEUE" -E -v "$FOUND" -m "$MODEL" -D "DNP DS620" -o printer-is-shared=true \
+        && echo "Warteschlange $QUEUE fuer $FOUND angelegt"
+    elif [ "$FOUND" != "$CURRENT" ]; then
+      lpadmin -p "$QUEUE" -v "$FOUND" && echo "Warteschlange $QUEUE zeigt jetzt auf $FOUND (vorher $CURRENT)"
+    else
+      echo "Warteschlange $QUEUE passt zum angeschlossenen Drucker"
+    fi
+    if ! grep -q "$MARKER" "/etc/cups/ppd/$QUEUE.ppd" 2>/dev/null; then
+      apply_ppd "$QUEUE"
+    fi
+    lpadmin -p "$QUEUE" -o printer-is-shared=true
+    cupsenable "$QUEUE"
+    cupsaccept "$QUEUE"
+    exit 0
+  fi
+  sleep 30
+done
+echo "Kein DNP DS620 am USB gefunden"
+exit 0

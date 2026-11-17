@@ -1,0 +1,12 @@
+[Unit]
+Description=Fotobox-PrintServer: Einrichtung beim ersten Start einer Karte aus dem Basis-Abbild
+ConditionPathExists=/etc/fotobox-firstboot
+After=local-fs.target
+Before=ssh.service fotobox-wifi.service cups.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fotobox-firstboot
+
+[Install]
+WantedBy=multi-user.target
