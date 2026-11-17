@@ -1,32 +1,35 @@
 #!/bin/bash
-# Richtet die Warteschlange fuer den DNP DS620 ein und haelt sie passend.
+# Richtet die Warteschlange fuer den angeschlossenen DNP-Drucker ein und haelt
+# sie passend. Erkannt werden alle DNP-Modelle, die das installierte Gutenprint
+# kennt (DS40, DS80, DS80DX, DS-RX1, DS620, DS820, QW410).
 #
 # - Gibt es noch keine Gutenprint-Warteschlange, wird eine angelegt, sobald
-#   ein DS620 am USB haengt.
-# - Zeigt die Warteschlange auf einen anderen Drucker (andere Seriennummer),
-#   wird sie auf den angeschlossenen umgestellt.
+#   ein DNP-Drucker am USB haengt.
+# - Zeigt die Warteschlange auf einen anderen Drucker (andere Seriennummer
+#   oder anderes Modell), wird sie auf den angeschlossenen umgestellt.
 # - Fehlt der PPD die Fotobox-Anpassung, wird sie neu erzeugt und angepasst.
 #
 # Laeuft beim Start und wartet bis zu 30 Minuten auf einen Drucker.
 set -u
-MODEL="gutenprint.5.3://dnp-ds620/expert"
-PREFIX="gutenprint53+usb://dnp-ds620/"
-NEW_QUEUE="DS620"
-MARKER='Fotobox-Anpassung 2'
+PREFIX="gutenprint53+usb://dnp-"
+MARKER='Fotobox-Anpassung 3'
 DRIVER=/usr/lib/cups/driver/gutenprint.5.3
 
 queue_line() { lpstat -v 2>/dev/null | grep 'gutenprint53+usb://' | head -1; }
 
+# gutenprint53+usb://dnp-ds620/SERIE -> dnp-ds620
+model_id() { echo "$1" | sed -n 's|^gutenprint53+usb://\([^/]*\)/.*$|\1|p'; }
+
 apply_ppd() {
-  # $1 Warteschlange. Erzeugt die PPD frisch aus dem Treiber und passt sie an.
-  local queue="$1" raw patched
+  # $1 Warteschlange, $2 Treibermodell. Erzeugt die PPD frisch aus dem Treiber und passt sie an.
+  local queue="$1" model="$2" raw patched
   raw=$(mktemp /tmp/fotobox-ppd.XXXXXX)
   patched=$(mktemp /tmp/fotobox-ppd.XXXXXX)
-  if "$DRIVER" cat "$MODEL" > "$raw" 2>/dev/null && [ -s "$raw" ] \
+  if "$DRIVER" cat "$model" > "$raw" 2>/dev/null && [ -s "$raw" ] \
      && /usr/local/sbin/fotobox-ppd "$raw" "$patched"; then
     lpadmin -p "$queue" -P "$patched" && echo "PPD der Warteschlange $queue erneuert"
   else
-    echo "PPD konnte nicht erzeugt oder angepasst werden"
+    echo "PPD fuer $model konnte nicht erzeugt oder angepasst werden"
   fi
   rm -f "$raw" "$patched"
 }
@@ -34,20 +37,32 @@ apply_ppd() {
 for attempt in $(seq 1 60); do
   FOUND=$(lpinfo -v 2>/dev/null | grep -o "${PREFIX}[^ ]*" | head -1)
   if [ -n "$FOUND" ]; then
+    ID=$(model_id "$FOUND")
+    MODEL="gutenprint.5.3://$ID/expert"
+    if ! lpinfo -m 2>/dev/null | grep -q "^$MODEL "; then
+      echo "Drucker $ID gefunden, aber das installierte Gutenprint hat keinen Treiber $MODEL."
+      echo "Vorhandene DNP-Treiber:"
+      lpinfo -m 2>/dev/null | grep -i 'gutenprint.*dnp-.*/expert' | sed 's/^/  /'
+      exit 0
+    fi
     LINE=$(queue_line)
     QUEUE=$(echo "$LINE" | sed -n 's/^device for \([^:]*\): .*/\1/p')
     CURRENT=$(echo "$LINE" | sed -n 's/^device for [^:]*: \(.*\)$/\1/p')
     if [ -z "$QUEUE" ]; then
-      QUEUE="$NEW_QUEUE"
-      lpadmin -p "$QUEUE" -E -v "$FOUND" -m "$MODEL" -D "DNP DS620" -o printer-is-shared=true \
+      QUEUE=$(echo "${ID#dnp-}" | tr '[:lower:]' '[:upper:]')
+      lpadmin -p "$QUEUE" -E -v "$FOUND" -m "$MODEL" -D "DNP $QUEUE" -o printer-is-shared=true \
         && echo "Warteschlange $QUEUE fuer $FOUND angelegt"
+      apply_ppd "$QUEUE" "$MODEL"
+    elif [ "$(model_id "$CURRENT")" != "$ID" ]; then
+      lpadmin -p "$QUEUE" -v "$FOUND" && echo "Warteschlange $QUEUE: anderes Modell, jetzt $FOUND (vorher $CURRENT)"
+      apply_ppd "$QUEUE" "$MODEL"
     elif [ "$FOUND" != "$CURRENT" ]; then
       lpadmin -p "$QUEUE" -v "$FOUND" && echo "Warteschlange $QUEUE zeigt jetzt auf $FOUND (vorher $CURRENT)"
     else
       echo "Warteschlange $QUEUE passt zum angeschlossenen Drucker"
     fi
     if ! grep -q "$MARKER" "/etc/cups/ppd/$QUEUE.ppd" 2>/dev/null; then
-      apply_ppd "$QUEUE"
+      apply_ppd "$QUEUE" "$MODEL"
     fi
     lpadmin -p "$QUEUE" -o printer-is-shared=true
     cupsenable "$QUEUE"
@@ -56,5 +71,5 @@ for attempt in $(seq 1 60); do
   fi
   sleep 30
 done
-echo "Kein DNP DS620 am USB gefunden"
+echo "Kein DNP-Drucker am USB gefunden"
 exit 0

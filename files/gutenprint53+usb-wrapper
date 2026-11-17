@@ -1,13 +1,18 @@
 #!/bin/sh
-# Vorgeschaltetes CUPS-Backend fuer den DNP DS620.
+# Vorgeschaltetes CUPS-Backend fuer DNP-Drucker.
 #
-# Das Format w243h432 (Gutenprint: 3.375x6) dient als Traeger fuer den
-# 5,6-cm-Fotostreifen. Der Drucker nimmt die Schnittlaenge in Schritten von
-# 0,1 Zoll (CNTRL FULL_CUTTER_SET); Gutenprint schickt fuer dieses Format den
-# Wert 34. Dieses Skript ersetzt ihn durch 22 (2,2 Zoll = 55,9 mm).
-# Alle anderen Auftraege und die Geraetesuche gehen unveraendert weiter.
+# Nur DNP DS620: Das Format w243h432 (Gutenprint: 3.375x6) dient als Traeger
+# fuer den 5,6-cm-Fotostreifen. Der Drucker nimmt die Schnittlaenge in
+# Schritten von 0,1 Zoll (CNTRL FULL_CUTTER_SET); Gutenprint schickt fuer
+# dieses Format den Wert 34. Dieses Skript ersetzt ihn durch 22 (2,2 Zoll =
+# 55,9 mm). Alle anderen Auftraege, alle anderen Drucker und die Geraetesuche
+# gehen unveraendert weiter.
 REAL=/usr/lib/cups/backend-real/gutenprint53+usb
 if [ $# -lt 5 ]; then exec "$REAL" "$@"; fi
+case "${DEVICE_URI:-}" in
+  *://dnp-ds620/*) ;;
+  *) exec "$REAL" "$@" ;;
+esac
 case "$5" in
   *PageSize=w243h432*) ;;
   *) exec "$REAL" "$@" ;;

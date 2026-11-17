@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Passt die Gutenprint-PPD des DNP DS620 fuer AirPrint an.
+"""Passt die Gutenprint-PPD eines DNP-Druckers fuer AirPrint an.
 
 Aufruf: fotobox-ppd EINGABE.ppd AUSGABE.ppd
 
-Hintergrund: iOS unterscheidet Papiere nur nach ihren Massen. In der PPD von
-Gutenprint haben mehrere Formate dieselben Masse wie 4x6 (297,6 x 460,8 pt):
-die Streifenformate, die der Drucker aus einem 4x6-Feld schneidet. Ohne
-Anpassung landet ein 10x15-Druck vom iPad auf dem falschen Format.
+Hintergrund: iOS unterscheidet Papiere nur nach ihren Massen. In den PPDs von
+Gutenprint haben oft mehrere Formate dieselben Masse: neben dem einfachen
+Format die Varianten, die der Drucker aus demselben Feld schneidet (z. B. 4x6
+und 2x6*2). Ohne Anpassung landet ein Druck vom iPad auf dem falschen Format.
 
-Was das Skript tut:
-  - 4x6 (w288h432) bleibt, wie es ist, und wird Standard.
-  - 2x6 (w144h432) bekommt die Blattlaenge 468,0 pt.
-  - 3.375x6 (w243h432) bekommt die Blattlaenge 475,2 pt. Es dient als Traeger
-    fuer den 5,6-cm-Streifen; den Schnitt setzt das vorgeschaltete Backend.
-  - Alle anderen Formate mit den Massen von 4x6 werden entfernt.
+Regel fuer jede Gruppe von Formaten mit gleichen Massen:
+  - Ein Format bleibt: 4x6 (w288h432), wenn es in der Gruppe ist, sonst das
+    erste einfache Format (ohne Mehrfachschnitt im Namen).
+  - Die anderen werden entfernt.
+
+Ausnahme DNP DS620 (Formate mit 297,6 x 460,8 pt):
+  - 2x6 (w144h432) bleibt und bekommt die Blattlaenge 468,0 pt.
+  - 3.375x6 (w243h432) bleibt und bekommt die Blattlaenge 475,2 pt. Es dient
+    als Traeger fuer den 5,6-cm-Streifen; den Schnitt setzt das vorgeschaltete
+    Backend.
 
 Die Breite der druckbaren Flaeche bleibt unveraendert. Eine schmalere Flaeche
 streckt der Treiber auf seine eigene Breite.
@@ -21,27 +25,29 @@ streckt der Treiber auf seine eigene Breite.
 import re
 import sys
 
-MARKER = "*% Fotobox-Anpassung 2"
-BASE = "w288h432"
-BASE_DIMENSION = (297.6, 460.8)
-# Format -> neue Blattlaenge in Punkt. Die Laengen muessen sich um mehr als
-# 5 pt unterscheiden, sonst ordnet CUPS Auftraege dem falschen Format zu.
-KEEP = {"w144h432": 468.0, "w243h432": 475.2}
-SECTIONS = ("PageSize", "PageRegion", "ImageableArea", "PaperDimension")
+MARKER = "*% Fotobox-Anpassung 3"
+PREFERRED = "w288h432"
+# Nur DS620: Streifenformate, die mit eigener Blattlaenge erhalten bleiben.
+# Die Laengen muessen sich um mehr als 5 pt unterscheiden, sonst ordnet CUPS
+# Auftraege dem falschen Format zu.
+STRIP_DIMENSION = (297.6, 460.8)
+STRIPS = {"w144h432": 468.0, "w243h432": 475.2}
 
 ENTRY = re.compile(r'^\*(?P<section>PageSize|PageRegion|ImageableArea|PaperDimension) (?P<name>[^/:\s]+)(?P<label>/[^:]*)?:\s*"(?P<value>[^"]*)"\s*$')
+DEFAULT = re.compile(r"^\*Default(PageSize|PageRegion|ImageableArea|PaperDimension):\s*(\S+)\s*$")
 
 
 def numbers(text):
     return [float(item) for item in re.findall(r"-?\d+(?:\.\d+)?", text)]
 
 
-def close(a, b):
-    return abs(a - b) < 0.05
-
-
 def mentions(line, name):
     return re.search(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", line) is not None
+
+
+def is_plain(name):
+    """Einfaches Format, kein Mehrfachschnitt (w288h432-div2, w360h504-w360h360_w360h144 ...)."""
+    return "-" not in name and "_" not in name
 
 
 def patch(text):
@@ -49,45 +55,74 @@ def patch(text):
     if any(line.strip() == MARKER for line in lines):
         return text, "schon angepasst"
 
-    # Alle Formate mit den Massen von 4x6 finden
-    same = []
+    # Formate in Dateireihenfolge mit ihren Massen
+    order, dimension = [], {}
     for line in lines:
         match = ENTRY.match(line)
         if match and match.group("section") == "PaperDimension":
             value = numbers(match.group("value"))
-            if len(value) == 2 and close(value[0], BASE_DIMENSION[0]) and close(value[1], BASE_DIMENSION[1]):
-                same.append(match.group("name"))
-    if BASE not in same:
-        raise SystemExit("In der PPD fehlt das Format %s mit %.1f x %.1f pt, Abbruch." % ((BASE,) + BASE_DIMENSION))
-    remove = [name for name in same if name != BASE and name not in KEEP]
-    missing = [name for name in KEEP if name not in same]
+            if len(value) == 2:
+                order.append(match.group("name"))
+                dimension[match.group("name")] = (round(value[0], 1), round(value[1], 1))
+    if not order:
+        raise SystemExit("In der PPD stehen keine Papierformate, Abbruch.")
+
+    groups = {}
+    for name in order:
+        groups.setdefault(dimension[name], []).append(name)
+
+    keep_as_strip, remove, kept = {}, [], {}
+    for size, names in groups.items():
+        if len(names) == 1:
+            continue
+        if PREFERRED in names:
+            base = PREFERRED
+        else:
+            base = next((name for name in names if is_plain(name)), names[0])
+        kept[size] = base
+        for name in names:
+            if name == base:
+                continue
+            if size == STRIP_DIMENSION and base == PREFERRED and name in STRIPS:
+                keep_as_strip[name] = STRIPS[name]
+            else:
+                remove.append(name)
 
     out = []
     for line in lines:
+        default = DEFAULT.match(line)
+        if default:
+            # Standardformat: 4x6, wenn vorhanden; sonst nur ersetzen, wenn es entfernt wird.
+            current = default.group(2)
+            if PREFERRED in order:
+                line = line.split(":", 1)[0] + ": " + PREFERRED
+            elif current in remove:
+                line = line.split(":", 1)[0] + ": " + kept[dimension[current]]
+            out.append(line)
+            continue
         if any(mentions(line, name) for name in remove):
             continue
         match = ENTRY.match(line)
-        if match and match.group("name") in KEEP and match.group("name") in same:
-            length = KEEP[match.group("name")]
-            shift = (length - BASE_DIMENSION[1]) / 2
-            head = "*%s %s%s:\t" % (match.group("section"), match.group("name"), match.group("label") or "")
+        if match and match.group("name") in keep_as_strip:
+            name = match.group("name")
+            length = keep_as_strip[name]
+            shift = (length - STRIP_DIMENSION[1]) / 2
+            head = "*%s %s%s:\t" % (match.group("section"), name, match.group("label") or "")
             section = match.group("section")
             if section in ("PageSize", "PageRegion"):
-                line = head + '"<</PageSize[%.3f %.3f]/ImagingBBox null>>setpagedevice"' % (BASE_DIMENSION[0], length)
+                line = head + '"<</PageSize[%.3f %.3f]/ImagingBBox null>>setpagedevice"' % (STRIP_DIMENSION[0], length)
             elif section == "PaperDimension":
-                line = head + '"%.3f %.3f"' % (BASE_DIMENSION[0], length)
+                line = head + '"%.3f %.3f"' % (STRIP_DIMENSION[0], length)
             else:
                 left, bottom, right, top = numbers(match.group("value"))
                 line = head + '"%.3f %.3f %.3f %.3f"' % (left, bottom + shift, right, top + shift)
-        elif re.match(r"^\*Default(PageSize|PageRegion|ImageableArea|PaperDimension):", line):
-            line = line.split(":", 1)[0] + ": " + BASE
         out.append(line)
 
-    # Marke hinter die erste Zeile (*PPD-Adobe) setzen
     out.insert(1, MARKER)
-    note = "angepasst; entfernt: %s" % (", ".join(remove) or "nichts")
-    if missing:
-        note += "; nicht vorhanden: %s" % ", ".join(missing)
+    note = "angepasst; behalten je Mass: %s; entfernt: %s" % (
+        ", ".join(sorted(kept.values())) or "nichts doppelt", ", ".join(remove) or "nichts")
+    if keep_as_strip:
+        note += "; Streifen: %s" % ", ".join(sorted(keep_as_strip))
     return "\n".join(out), note
 
 

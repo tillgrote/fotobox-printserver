@@ -1,9 +1,30 @@
 # Fotobox-PrintServer
 
-Macht aus einem Raspberry Pi einen AirPrint-Druckserver für den DNP DS620, so
-dass die Fotobox-App auf dem iPad 10×15-Bilder und Fotostreifen drucken kann.
+Macht aus einem Raspberry Pi einen AirPrint-Druckserver für Fotodrucker von
+DNP, so dass die Fotobox-App auf dem iPad drucken kann.
 
 Der Pi hängt per USB am Drucker und per WLAN im selben Netz wie das iPad.
+
+## Drucker
+
+Erkannt wird jeder DNP-Drucker, für den das installierte Gutenprint einen
+Treiber hat. Das Modell liest der Pi vom USB ab.
+
+| Drucker | 10×15 | Streifen | Stand |
+|---|---|---|---|
+| DS620 | ja | 5 cm und 5,6 cm, vom Drucker geschnitten | getestet |
+| QW410 | ja, mit 4-Zoll-Papier | nein | nicht getestet |
+| DS40, DS-RX1 | ja | nein | nicht getestet |
+| DS80, DS80DX, DS820 | kein 10×15 (8-Zoll-Drucker) | nein | nicht getestet |
+
+Zu den nicht getesteten Modellen: Die Anpassung der Papierformate ist für sie
+nur an nachgebauten PPDs aus dem Gutenprint-Quelltext geprüft, nicht am Gerät.
+Ob das Gutenprint des Betriebssystems ein Modell kennt, zeigt
+`lpinfo -m | grep -i dnp`; fehlt der Treiber, meldet `fotobox-printer` das im
+Protokoll.
+
+Beim QW410 bleiben nur die Formate für 4 Zoll breites Papier. Mit 4,5 Zoll
+breitem Papier druckt er über diesen Server nicht.
 
 ## Stand
 
@@ -32,7 +53,8 @@ Der Pi hängt per USB am Drucker und per WLAN im selben Netz wie das iPad.
    Das Skript fragt nach einem Passwort für das Einrichtungs-WLAN. Auf einem Pi
    Zero dauert die Installation der Pakete eine Weile.
 4. **Drucker anschließen** (am Pi Zero über ein OTG-Kabel) und einschalten. Die
-   Warteschlange `DS620` entsteht dann von selbst, spätestens nach 30 Sekunden.
+   Warteschlange entsteht dann von selbst, spätestens nach 30 Sekunden, und
+   heißt wie das Modell (`DS620`, `QW410` ...).
 5. **Auf dem iPad** in der Fotobox-App unter Admin > Druck den Drucker wählen.
 
 ## Was eingerichtet wird
@@ -40,9 +62,9 @@ Der Pi hängt per USB am Drucker und per WLAN im selben Netz wie das iPad.
 | Teil | Zweck |
 |---|---|
 | CUPS, Gutenprint, Avahi | Druckdienst, Treiber, AirPrint-Bekanntgabe |
-| `fotobox-printer` | legt die Warteschlange für den angeschlossenen DS620 an und passt deren PPD an |
+| `fotobox-printer` | legt die Warteschlange für den angeschlossenen DNP-Drucker an und passt deren PPD an |
 | `fotobox-ppd` | macht die Papierformate für iOS unterscheidbar (siehe unten) |
-| vorgeschaltetes Backend | schneidet den 5,6-cm-Streifen bei 2,2 Zoll |
+| vorgeschaltetes Backend | schneidet beim DS620 den 5,6-cm-Streifen bei 2,2 Zoll |
 | `fotobox-wifi` | Seite zum WLAN-Wechsel und für Updates |
 | `fotobox-update` | holt den aktuellen Stand dieses Repos |
 
@@ -65,17 +87,21 @@ In `main` gehört deshalb nur, was auf einem Pi getestet ist.
 
 ## Warum die PPD angepasst wird
 
-iOS unterscheidet Papiere nur nach ihren Maßen. In der Gutenprint-PPD haben
-mehrere Formate dieselben Maße wie 4x6, nämlich die Streifen, die der Drucker
-aus einem 4x6-Feld schneidet. Ohne Anpassung landet ein 10×15-Druck auf dem
-falschen Format. `fotobox-ppd` ändert deshalb:
+iOS unterscheidet Papiere nur nach ihren Maßen. In den Gutenprint-PPDs haben
+oft mehrere Formate dieselben Maße: neben dem einfachen Format die Varianten,
+die der Drucker aus demselben Feld schneidet (z. B. 4x6 und 2x6*2). Ohne
+Anpassung landet ein Druck vom iPad auf dem falschen Format.
+
+`fotobox-ppd` lässt deshalb von allen Formaten mit gleichen Maßen nur eines
+übrig: 4x6 (`w288h432`), wenn es dabei ist, sonst das erste einfache Format.
+
+Ausnahme DS620, damit der Drucker Streifen schneiden kann:
 
 | Format | Änderung |
 |---|---|
 | `w288h432` (4x6) | bleibt, wird Standard |
-| `w144h432` (2x6) | Blattlänge 468,0 pt statt 460,8 |
-| `w243h432` (3.375x6) | Blattlänge 475,2 pt; Träger für den 5,6-cm-Streifen |
-| alle anderen mit den Maßen von 4x6 | entfernt |
+| `w144h432` (2x6) | bleibt, Blattlänge 468,0 pt statt 460,8 |
+| `w243h432` (3.375x6) | bleibt, Blattlänge 475,2 pt; Träger für den 5,6-cm-Streifen |
 
 Die Breite der druckbaren Fläche bleibt unverändert, weil der Treiber eine
 schmalere Fläche auf seine eigene Breite streckt.
@@ -93,8 +119,8 @@ nicht getestet.
 
 ## Grenzen
 
-- Nur DNP DS620 über Gutenprint.
-- Die Lage der Streifen auf dem Papier ist in der App an einem einzelnen DS620
-  gemessen.
+- Nur DNP-Drucker über Gutenprint.
+- Die Streifenvorlagen der App funktionieren nur mit dem DS620. Die Lage der
+  Streifen auf dem Papier ist in der App an einem einzelnen DS620 gemessen.
 - Ein Update von Gutenprint kann eine neu erzeugte PPD verändern.
   `fotobox-printer` passt sie beim nächsten Start wieder an.
